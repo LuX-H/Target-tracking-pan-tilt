@@ -43,7 +43,7 @@ def format_offset(value):
     Args:
         value: 偏移量（-320到+320之间）
     Returns:
-        4位ASCII字符串，如 "+050", "-120", "+000"
+        4位ASCII字符串
     """
     value = max(-999, min(999, value))
     return f"{value:+.3d}".replace('+', ' ') 
