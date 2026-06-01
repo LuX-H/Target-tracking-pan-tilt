@@ -12,13 +12,12 @@ import bluetooth
 import subprocess
 import struct
 
-# 蓝牙服务配置
+# 蓝牙配置
 SERVER_PORT = 1
 BUFFER_SIZE = 1024
 
-# 协议常量
-STX = 0x02  # 帧起始符
-ETX = 0x03  # 帧结束符
+STX = 0x02  # 帧起始
+ETX = 0x03  # 帧结束
 
 def setup_bluetooth():
     print("正在配置蓝牙设备...")
@@ -52,13 +51,10 @@ def parse_protocol_frame(data):
         # 提取帧内容（包含STX和ETX）
         frame = data[start_idx:end_idx+1]
         
-        # 转换为字符串进行解析
         frame_str = frame.decode('utf-8', errors='ignore')
-        
-        # 移除STX和ETX
         content = frame_str.strip(chr(STX) + chr(ETX))
         
-        # 分割X和Y值
+        # 分割X、Y
         parts = content.split()
         if len(parts) != 2:
             return None
@@ -66,7 +62,7 @@ def parse_protocol_frame(data):
         x_str = parts[0].strip()
         y_str = parts[1].strip()
         
-        # 解析偏移量
+        # 偏移量
         x_offset = int(x_str)
         y_offset = int(y_str)
         
