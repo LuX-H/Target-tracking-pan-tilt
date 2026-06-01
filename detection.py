@@ -1,35 +1,32 @@
+"""
+激光点检测
+  - 检测线程：摄像头采集 → 激光点检测 → 串口发送偏移量
+  - 主线程：投屏原始画面 + 检测标注画面 + 遮罩画面
+"""
+
 import cv2
 import numpy as np
-import time 
-import os.path as osp
-import sys
-import struct
-import math
+import time
+import threading
 import serial
 import serial.tools.list_ports
-import threading
 
-def pack_point(point):
-    x, y = point
-    return struct.pack('HH', int(x), int(y))
+# ==================== 通信协议 ====================
+STX = 0x02
+ETX = 0x03
+SEND_INTERVAL = 0.02  # 50Hz
 
-# 通信协议
-STX = 0x02  # 帧起始
-ETX = 0x03  # 帧结束
-SEND_INTERVAL = 0.02  # 发送间隔20ms
-
+# ==================== 串口通信 ====================
 def init_serial(port=None, baud_rate=115200, timeout=0.1):
-    """初始化串口通信"""
+    """初始化串口，未指定端口则自动查找"""
     if port is None:
-        # 自动查找可用串口
         ports = list(serial.tools.list_ports.comports())
-        if len(ports) == 0:
+        if not ports:
             print("未找到可用串口")
             return None
-        # 优先选择第一个串口
         port = ports[0].device
         print(f"自动选择串口: {port}")
-    
+
     try:
         ser = serial.Serial(port, baud_rate, timeout=timeout)
         print(f"串口 {port} 已打开，波特率: {baud_rate}")
@@ -38,198 +35,207 @@ def init_serial(port=None, baud_rate=115200, timeout=0.1):
         print(f"打开串口失败: {e}")
         return None
 
+
 def format_offset(value):
-    """将偏移量格式化为带符号的4位ASCII字符串
-    Args:
-        value: 偏移量（-320到+320之间）
-    Returns:
-        4位ASCII字符串
-    """
+    """将偏移量格式化为4位带符号ASCII，范围[-999, 999]"""
     value = max(-999, min(999, value))
-    return f"{value:+.3d}".replace('+', ' ') 
+    return f"{value:+.3d}".replace('+', ' ')
+
 
 def send_offset_via_uart(ser, dx, dy):
-    """按照指定协议发送偏移量到下位机
-    帧格式: <STX> Xxxx Yyyy <ETX>
-    Xxxx: X轴偏移量
-    Yyyy: Y轴偏移量
-    """
-    if ser is None:
+    """按协议帧格式发送：<STX> Xxxx Yyyy <ETX>"""
+    if ser is None or not ser.is_open:
         return False
     try:
-        # 格式化偏移量
         x_str = format_offset(dx)
         y_str = format_offset(dy)
-        packet = bytes([STX]) + x_str.encode('ascii') + b' ' + y_str.encode('ascii') + bytes([ETX])
-        ser.write(packet) #发送数据
-        print(f"发送数据: {packet.hex()} | 偏移量: dx={dx}, dy={dy}")
+        packet = bytes([STX]) + x_str.encode() + b' ' + y_str.encode() + bytes([ETX])
+        ser.write(packet)
         return True
     except Exception as e:
         print(f"串口发送失败: {e}")
         return False
 
-# 全局变量用于控制线程
-running = True
 
-def raw_camera_display():
-    global running
-    #显示摄像头画面
-    cap_raw = cv2.VideoCapture(0)
-    cap_raw.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap_raw.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap_raw.set(cv2.CAP_PROP_FPS, 30)
-    cap_raw.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    # 设置摄像头参数以提高画面清晰度
-    cap_raw.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  #自动曝光
-    cap_raw.set(cv2.CAP_PROP_EXPOSURE, -4)  #曝光值（负数表示自动）
-    cap_raw.set(cv2.CAP_PROP_AUTO_WB, 1)  #自动白平衡
-    cap_raw.set(cv2.CAP_PROP_BRIGHTNESS, 128)  #亮度
-    cap_raw.set(cv2.CAP_PROP_CONTRAST, 128)  #对比度
-    cap_raw.set(cv2.CAP_PROP_SATURATION, 128)  #饱和度
-    print("画面已启动")
-    
-    while running:
-        ret, frame = cap_raw.read()
+# ==================== 激光点检测 ====================
+LOWER_RED1 = np.array([0, 80, 60])
+UPPER_RED1 = np.array([10, 255, 255])
+LOWER_RED2 = np.array([170, 80, 60])
+UPPER_RED2 = np.array([180, 255, 255])
+MORPH_KERNEL = np.ones((3, 3), np.uint8)
+BLUR_SIZE = (15, 15)
+
+def create_red_mask(hsv):
+    mask1 = cv2.inRange(hsv, LOWER_RED1, UPPER_RED1)
+    mask2 = cv2.inRange(hsv, LOWER_RED2, UPPER_RED2)
+    return cv2.bitwise_or(mask1, mask2)
+
+
+def detect_laser(frame):
+    """
+    检测红色激光点。
+    利用干涉条纹对称分布的特性，对红色遮罩做高斯模糊后取峰值位置，
+    对称噪声不偏移质心，天然抗干涉环干扰。
+    Returns:
+        (x, y) 或 None, mask
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = create_red_mask(hsv)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL, iterations=1)
+
+    if cv2.countNonZero(mask) < 15:
+        return None, mask
+    blurred = cv2.GaussianBlur(mask.astype(np.float32), BLUR_SIZE, 0)
+    _, _, _, max_loc = cv2.minMaxLoc(blurred)
+
+    if blurred[max_loc[1], max_loc[0]] < 1.0:
+        return None, mask
+    return max_loc, mask
+
+
+class SharedState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.raw_frame = None          # 原始画面
+        self.annotated_frame = None    # 检测标注画面
+        self.mask = None               # 红色遮罩
+        self.has_laser = False
+        self.dx = 0
+        self.dy = 0
+        self.fps = 0.0
+        self.running = True
+
+    def update(self, **kwargs):
+        with self._lock:
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    def snapshot(self):
+        with self._lock:
+            return (
+                self.raw_frame.copy()           if self.raw_frame is not None          else None,
+                self.annotated_frame.copy()     if self.annotated_frame is not None    else None,
+                self.mask.copy()                if self.mask is not None               else None,
+                self.has_laser,
+                self.dx,
+                self.dy,
+                self.fps,
+                self.running,
+            )
+    def stop(self):
+        with self._lock:
+            self.running = False
+
+    def is_running(self):
+        with self._lock:
+            return self.running
+
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+IMAGE_CENTER = (FRAME_WIDTH // 2, FRAME_HEIGHT // 2)
+
+def detection_thread(cap, ser, shared):
+    """采集、检测、串口发送"""
+    prev_time = time.time()
+    last_send_time = time.time()
+
+    while shared.is_running():
+        ret, frame = cap.read()
         if not ret:
             time.sleep(0.01)
             continue
-        cv2.imshow("Raw Camera Feed", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            running = False
+        # FPS
+        now = time.time()
+        dt = now - prev_time
+        fps = 1.0 / dt if dt > 0.001 else 0
+        prev_time = now
+        raw_frame = frame.copy()
+        laser_center, mask = detect_laser(frame)
+        annotated = frame.copy()
+        dx, dy = 0, 0
+        has_laser = False
+
+        if laser_center is not None:
+            dx = laser_center[0] - IMAGE_CENTER[0]
+            dy = laser_center[1] - IMAGE_CENTER[1]
+            has_laser = True
+
+            # 绘制检测标注
+            cv2.circle(annotated, laser_center, 8, (0, 255, 0), -1)
+            cv2.circle(annotated, IMAGE_CENTER, 4, (255, 0, 0), -1)
+            cv2.line(annotated, IMAGE_CENTER, laser_center, (0, 255, 255), 2)
+            cv2.putText(annotated, f"dx={dx:+.3d} dy={dy:+.3d}",
+                        (laser_center[0] + 12, laser_center[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            # 按间隔发送
+            if now - last_send_time >= SEND_INTERVAL:
+                if send_offset_via_uart(ser, dx, dy):
+                    print(f"发送: dx={dx:+.3d}, dy={dy:+.3d}")
+                last_send_time = now
+        else:
+            cv2.putText(annotated, "No Laser", (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        cv2.putText(annotated, f"FPS: {fps:.1f}", (10, FRAME_HEIGHT - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        # 写入共享状态
+        shared.update(
+            raw_frame=raw_frame,
+            annotated_frame=annotated,
+            mask=mask,
+            has_laser=has_laser,
+            dx=dx, dy=dy,
+            fps=fps,
+        )
+
+def main():
+    # 摄像头
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    ser = init_serial()
+    shared = SharedState()
+    det_thread = threading.Thread(
+        target=detection_thread,
+        args=(cap, ser, shared),
+        name="Detection",
+        daemon=True,
+    )
+
+    det_thread.start()
+    print("激光点检测已启动 | 按 'q' 退出")
+    cv2.namedWindow("Raw Camera Feed", cv2.WINDOW_NORMAL)      # 投屏窗口
+    cv2.namedWindow("Laser Detection", cv2.WINDOW_NORMAL)      # 检测标注
+    cv2.namedWindow("Mask", cv2.WINDOW_NORMAL)                 # 红色遮罩
+
+    # 主循环
+    while True:
+        raw_frame, annotated, mask, has_laser, dx, dy, fps, running = shared.snapshot()
+
+        if not running:
             break
-    cap_raw.release()
-    print("画面已退出")
-    
-# 摄像头标定参数（示例数值，需替换）
-camera_matrix = np.array([[800, 0, 320],
-                          [0, 800, 240],
-                          [0, 0, 1]], dtype=np.float32)
-dist_coeffs = np.array([-0.3, 0.1, 0, 0], dtype=np.float32)
+        if raw_frame is not None:
+            cv2.imshow("Raw Camera Feed", raw_frame)
+        if annotated is not None:
+            cv2.imshow("Laser Detection", annotated)
+        if mask is not None:
+            cv2.imshow("Mask", mask)
 
-# 检测算法
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-cap.set(cv2.CAP_PROP_FPS, 30)
-cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # 提升 USB 传输效率
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            shared.stop()
+            break
 
-# 初始化串口（可指定端口，如 'COM3'，init_serial('COM3')，默认自动查找）
-ser = init_serial() 
-IMAGE_CENTER = (320, 240)
-prev_time = time.time()
-fps = 0
-last_send_time = time.time() 
-step_per_frame = 1      # 每帧只描绘1个点
-frame_count = 0  
+    det_thread.join(timeout=2)
+    cap.release()
+    cv2.destroyAllWindows()
+    if ser is not None and ser.is_open:
+        ser.close()
+        print("串口已关闭")
+    print("程序已退出")
 
-# 投屏
-raw_display_thread = threading.Thread(target=raw_camera_display, daemon=True)
-raw_display_thread.start()
-
-while running:
-    ret, frame = cap.read()
-    if not ret:
-        time.sleep(0.01)
-        continue
-    current_time = time.time()
-    fps = 1.0 / (current_time - prev_time)
-    prev_time = current_time
-
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    
-    lower_red1 = np.array([0, 80, 60])
-    upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([170, 80, 60])
-    upper_red2 = np.array([180, 255, 255])
-    
-    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    mask = cv2.bitwise_or(mask1, mask2)
-    
-    # 去噪
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    
-    laser_center = None
-    laser_radius = None
-    
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    best_circle = None
-    best_score = 0
-    
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        
-        if area < 20 or area > 1500:
-            continue
-  
-        (x, y), radius = cv2.minEnclosingCircle(cnt)
-        center = (int(x), int(y))
-        radius = int(radius)
-        
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter == 0:
-            continue
-        circularity = (4 * np.pi * area) / (perimeter ** 2)
-
-        circle_mask = np.zeros_like(mask)
-        cv2.circle(circle_mask, center, radius, 255, -1)
-        
-        overlap = cv2.bitwise_and(mask, circle_mask)
-        overlap_area = cv2.countNonZero(overlap)
-        match_ratio = overlap_area / max(area, cv2.countNonZero(circle_mask))
-
-        score = circularity * 50 + match_ratio * 50
-        
-        if score > best_score:
-            best_score = score
-            best_circle = (center, radius, score)
-    
-    if best_circle is not None and best_score > 0.3:
-        laser_center, laser_radius, score = best_circle
-        print(f"激光点检测 - 中心: {laser_center}, 半径: {laser_radius}, 评分: {score:.2f}")
-    else:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_masked = cv2.bitwise_and(gray, gray, mask=mask)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(gray_masked)
-        
-        if max_val > 150:
-            laser_center = max_loc
-            print(f"备选检测 - 最亮点: {laser_center}, 亮度: {max_val}")
-    
-    if laser_center is not None:
-        cv2.circle(frame, laser_center, 8, (0, 0, 255), -1)
-        cv2.putText(frame, "Laser Point", (laser_center[0] + 10, laser_center[1] - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        cv2.putText(frame, f"FPS: {fps:.2f}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-        dx = laser_center[0] - IMAGE_CENTER[0]  # 水平偏移量
-        dy = laser_center[1] - IMAGE_CENTER[1]  # 垂直偏移量
-        print(f"检测到的激光点：({laser_center[0]}, {laser_center[1]}) | 偏移量: dx={dx}, dy={dy}")
-        
-        # 返回数据
-        current_time = time.time()
-        if current_time - last_send_time >= SEND_INTERVAL:
-            send_offset_via_uart(ser, dx, dy)
-            last_send_time = current_time
-    else:
-        cv2.putText(frame, "未检测到激光点", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-    
-    # 显示处理结果
-    cv2.imshow("Detected Frame", frame)
-    cv2.imshow("Laser Mask", mask)
-
-    # 退出
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        running = False
-        break
-
-# 等待线程结束 关闭串口
-raw_display_thread.join(timeout=1)
-cap.release()
-cv2.destroyAllWindows()
-if ser is not None and ser.is_open:
-    ser.close()
-    print("串口已关闭")
+if __name__ == '__main__':
+    main()
